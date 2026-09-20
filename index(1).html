@@ -3,6 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // ВСТАВЬ СЮДА значения из Supabase → Project Settings → API.
+  // Publishable/anon key можно использовать в браузере. service_role сюда НЕ вставлять.
+  const SUPABASE_URL = 'ТВОЙ_PROJECT_URL';
+  const SUPABASE_KEY = 'ТВОЙ_PUBLISHABLE_KEY';
+
+  const SUPABASE_CONFIGURED =
+    SUPABASE_URL.startsWith('http') &&
+    !SUPABASE_URL.includes('ТВОЙ_') &&
+    SUPABASE_KEY &&
+    !SUPABASE_KEY.includes('ТВОЙ_');
+
+  const supabaseClient = SUPABASE_CONFIGURED
+    ? supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
+    : null;
+</script>
 <meta name="theme-color" content="#04050c">
 <title>Короз-Декс — коллекционная гача</title>
 <style>
@@ -6038,6 +6055,124 @@ function testStorage() {
 }
 storageAvailable = testStorage();
 
+/* =====================================================================
+   SUPABASE — ОБЛАЧНОЕ СОХРАНЕНИЕ
+   Игра продолжает иметь localStorage как локальный кэш/offline fallback.
+   В Supabase хранится тот же сериализованный save.
+   ===================================================================== */
+let supabaseUser = null;
+let supabaseReady = false;
+let supabaseSaveTimer = null;
+let supabaseSyncInProgress = false;
+let supabaseHasRemoteSave = false;
+
+function getSupabaseSaveString() {
+  return serializedSave();
+}
+
+async function initSupabase() {
+  if (!supabaseClient) {
+    console.warn('[Короз-Декс] Supabase не настроен — используется только localStorage.');
+    return false;
+  }
+
+  try {
+    let sessionResult = await supabaseClient.auth.getSession();
+    let session = sessionResult && sessionResult.data ? sessionResult.data.session : null;
+
+    // Первый этап: анонимный аккаунт. Он позволяет хранить отдельный прогресс
+    // для каждого браузера без добавления формы регистрации прямо сейчас.
+    if (!session) {
+      const signInResult = await supabaseClient.auth.signInAnonymously();
+      if (signInResult.error) throw signInResult.error;
+      session = signInResult.data && signInResult.data.session;
+    }
+
+    if (!session || !session.user) throw new Error('Не удалось получить Supabase session');
+    supabaseUser = session.user;
+    supabaseReady = true;
+    return true;
+  } catch (e) {
+    supabaseReady = false;
+    console.warn('[Короз-Декс] Supabase недоступен:', e);
+    setTimeout(function () {
+      if (typeof toast === 'function') toast('☁️ Supabase пока недоступен — игра работает локально', 'warn');
+    }, 500);
+    return false;
+  }
+}
+
+async function loadSupabaseState() {
+  if (!supabaseReady || !supabaseUser) return false;
+
+  try {
+    const result = await supabaseClient
+      .from('game_saves')
+      .select('save_data')
+      .eq('player_id', supabaseUser.id)
+      .maybeSingle();
+
+    if (result.error) throw result.error;
+
+    const remoteSave = result.data && result.data.save_data;
+    if (!remoteSave) return false;
+
+    // Используем существующий импортёр игры, чтобы сохранить всю текущую
+    // структуру state и совместимость с импортом/экспортом.
+    supabaseSyncInProgress = true;
+    const imported = importSave(remoteSave);
+    supabaseSyncInProgress = false;
+
+    if (!imported || !imported.ok) {
+      console.warn('[Короз-Декс] Удалённое сохранение отклонено:', imported && imported.error);
+      return false;
+    }
+
+    supabaseHasRemoteSave = true;
+    return true;
+  } catch (e) {
+    supabaseSyncInProgress = false;
+    console.warn('[Короз-Декс] Не удалось загрузить сохранение из Supabase:', e);
+    return false;
+  }
+}
+
+function scheduleSupabaseSave(force) {
+  if (!supabaseReady || !supabaseUser || supabaseSyncInProgress) return;
+
+  if (force) {
+    if (supabaseSaveTimer) { clearTimeout(supabaseSaveTimer); supabaseSaveTimer = null; }
+    syncStateToSupabase();
+    return;
+  }
+
+  if (supabaseSaveTimer) return;
+  supabaseSaveTimer = setTimeout(function () {
+    supabaseSaveTimer = null;
+    syncStateToSupabase();
+  }, 700);
+}
+
+async function syncStateToSupabase() {
+  if (!supabaseReady || !supabaseUser || supabaseSyncInProgress) return;
+
+  try {
+    const saveData = getSupabaseSaveString();
+    const result = await supabaseClient
+      .from('game_saves')
+      .upsert({
+        player_id: supabaseUser.id,
+        save_data: saveData,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'player_id' });
+
+    if (result.error) throw result.error;
+    supabaseHasRemoteSave = true;
+  } catch (e) {
+    console.warn('[Короз-Декс] Не удалось сохранить в Supabase:', e);
+  }
+}
+
 const state = {
   owned: {},
   firstSeen: {},
@@ -6076,7 +6211,7 @@ const state = {
   alchemySeen: {}   // ← вот это
 };
 
-function loadState() {
+function loadLocalState() {
   if (!storageAvailable) return;
   try {
     const raw = window.localStorage.getItem(SAVE_KEY);
@@ -6190,16 +6325,23 @@ if (typeof data.events === 'object' && data.events) {
 
 let saveTimer = null;
 function saveState(force) {
-  if (!storageAvailable) return;
   if (force) {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     writeSave();
+    scheduleSupabaseSave(true);
     return;
   }
+
+  if (!storageAvailable) {
+    scheduleSupabaseSave(false);
+    return;
+  }
+
   if (saveTimer) return;
   saveTimer = setTimeout(function () {
     saveTimer = null;
     writeSave();
+    scheduleSupabaseSave(false);
   }, 500);
 }
 function writeSave() {
@@ -6285,12 +6427,12 @@ function decodeSave(encoded) {
 function serializedSave() {
   const json = JSON.stringify({
     app: 'korozdex', v: 1,
-    owned: state.owned, firstSeen: state.firstSeen, seen: state.seen,
+    owned: state.owned, firstSeen: state.firstSeen, seen: state.seen, xp: state.xp,
     coins: state.coins, pulls: state.pulls,
     charms: state.charms,
     ascended: state.ascended,
     events: { lastEndedAt: state.events.lastEndedAt },
-    sound: state.sound, customCursor: state.customCursor,
+    sound: state.sound, autoPull: state.autoPull, customCursor: state.customCursor,
     startedAt: state.startedAt, battleBest: state.battleBest,
     alchemy: state.alchemy, mutations: state.mutations
   });
@@ -6426,6 +6568,7 @@ function importSave(text) {
   state.coins     = (typeof data.coins === 'number' && isFinite(data.coins)) ? Math.max(0, Math.floor(data.coins)) : 0;
   state.pulls     = (typeof data.pulls === 'number' && isFinite(data.pulls)) ? Math.max(0, Math.floor(data.pulls)) : 0;
   if (typeof data.sound === 'boolean')       state.sound = data.sound;
+  if (typeof data.autoPull === 'boolean')      state.autoPull = data.autoPull;
   if (typeof data.customCursor === 'boolean') state.customCursor = data.customCursor;
   if (typeof data.battleBest === 'number' && isFinite(data.battleBest))
     state.battleBest = Math.max(0, Math.floor(data.battleBest));
@@ -8798,6 +8941,9 @@ document.addEventListener('visibilitychange', function () {
 });
 
 window.addEventListener('beforeunload', function () { saveState(true); });
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') saveState(true);
+});
 
 document.addEventListener('pointerdown', function once() {
   Sound.unlock();
@@ -12039,8 +12185,18 @@ const GoldenRooster = (function () {
 /* =====================================================================
    22. ИНИЦИАЛИЗАЦИЯ
    ===================================================================== */
-function init() {
-  loadState();
+async function init() {
+  // Сначала мгновенно поднимаем локальный кэш, затем подтягиваем облачную копию.
+  loadLocalState();
+
+  const cloudReady = await initSupabase();
+  if (cloudReady) {
+    const loadedRemote = await loadSupabaseState();
+    if (!loadedRemote) {
+      // Первый запуск в облаке: переносим локальный прогресс наверх.
+      await syncStateToSupabase();
+    }
+  }
 
   Sound.setEnabled(state.sound);
 updateSoundBtn();
@@ -12060,7 +12216,7 @@ if (autoPullActive) setTimeout(runAutoPullLoop, 900);
 
   if (!storageAvailable) {
     setTimeout(function () {
-      toast('⚠️ localStorage недоступен — прогресс сохранится только до перезагрузки', 'warn');
+      toast('⚠️ Локальное хранилище недоступно — используется облачное сохранение, если Supabase настроен', 'warn');
     }, 900);
   }
 
@@ -12143,6 +12299,7 @@ EventManager.onUpdate(function () {
   }
 
   console.log('%c🐓 Короз-Декс загружен', 'color:#6ee7ff;font-weight:bold;font-size:14px');
+  console.log('☁️ Supabase: ' + (supabaseReady ? 'подключён' : 'не настроен / offline'));
   console.log('Видов: ' + CREATURES.length + ' | Сумма весов: ' + VALIDATION.sum + ' | Валидация: ' + (VALIDATION.ok ? '✅' : '❌'));
 }
 
@@ -12184,12 +12341,6 @@ function activateTab(target) {
     if (target === 'gacha') GoldenRooster.start();
     else GoldenRooster.stop();
   }
-}
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
 }
 
 if (document.readyState === 'loading') {
