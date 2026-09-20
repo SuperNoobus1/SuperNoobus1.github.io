@@ -1,1 +1,32 @@
+-- Короз-Декс: первое облачное сохранение.
+-- ВАЖНО: в Supabase также включите Authentication -> Providers -> Anonymous Sign-Ins.
 
+create table if not exists public.game_saves (
+  player_id uuid primary key references auth.users(id) on delete cascade,
+  save_data text not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.game_saves enable row level security;
+
+drop policy if exists "Players can read own game save" on public.game_saves;
+create policy "Players can read own game save"
+on public.game_saves
+for select
+using (auth.uid() = player_id);
+
+drop policy if exists "Players can create own game save" on public.game_saves;
+create policy "Players can create own game save"
+on public.game_saves
+for insert
+with check (auth.uid() = player_id);
+
+drop policy if exists "Players can update own game save" on public.game_saves;
+create policy "Players can update own game save"
+on public.game_saves
+for update
+using (auth.uid() = player_id)
+with check (auth.uid() = player_id);
+
+create index if not exists game_saves_updated_at_idx
+on public.game_saves(updated_at);
